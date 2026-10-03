@@ -1,79 +1,94 @@
 import asyncio
 import json
-import os
+from pathlib import Path
 
-from openai import OpenAI
 from mcp import Client
+from openai import OpenAI
+
 from server import mcp
 
 
-client_openai = OpenAI()
+MODEL = "gpt-4.1-mini"
+PROJECT_DIR = Path(__file__).resolve().parent
+DATA_DIR = PROJECT_DIR / "data"
+
+openai_client = OpenAI()
 
 
-async def ask_mcp(question: str):
-    async with Client(mcp) as client:
-        tools = await client.list_tools()
+def convert_mcp_tools_to_openai(mcp_tools) -> list[dict]:
+    """MCPのTool定義をOpenAI Function Calling形式へ変換する。"""
+    return [
+        {
+            "type": "function",
+            "function": {
+                "name": tool.name,
+                "description": tool.description or "",
+                "parameters": tool.input_schema,
+            },
+        }
+        for tool in mcp_tools
+    ]
 
-        openai_tools = []
 
-        for tool in tools.tools:
-            openai_tools.append(
-                {
-                    "type": "function",
-                    "function": {
-                        "name": tool.name,
-                        "description": tool.description or "",
-                        "parameters": tool.input_schema,
-                    },
-                }
-            )
+async def ask_mcp(question: str) -> str:
+    """質問に応じてLLMがToolを選択し、MCP経由で実行して最終回答を返す。"""
 
-        response = client_openai.chat.completions.create(
-            model="gpt-4.1-mini",
+    async with Client(mcp) as mcp_client:
+        # MCP Serverが公開しているTool定義を取得する
+        tools_response = await mcp_client.list_tools()
+
+        # OpenAI Function Calling形式へ変換する
+        openai_tools = convert_mcp_tools_to_openai(tools_response.tools)
+
+        # 質問内容とTool定義をもとに、LLMが利用するToolを判断する
+        first_response = openai_client.chat.completions.create(
+            model=MODEL,
             messages=[
-                {
-                    "role": "user",
-                    "content": question
-                }
+                {"role": "user", "content": question},
             ],
-            tools=openai_tools
+            tools=openai_tools,
         )
 
-        tool_call = response.choices[0].message.tool_calls[0]
+        assistant_message = first_response.choices[0].message
 
+        # Tool利用が不要な場合はLLMの応答をそのまま返す
+        if not assistant_message.tool_calls:
+            return assistant_message.content or ""
+
+        # この実装では先頭のTool呼び出しを処理する
+        tool_call = assistant_message.tool_calls[0]
         tool_name = tool_call.function.name
         tool_args = json.loads(tool_call.function.arguments)
 
-        tool_result = await client.call_tool(
-            tool_name,
-            tool_args
-        )
-
+        # MCP Client経由でServer側のToolを実行する
+        tool_result = await mcp_client.call_tool(tool_name, tool_args)
         tool_output = tool_result.content[0].text
 
-        final_response = client_openai.chat.completions.create(
-            model="gpt-4.1-mini",
+        # Toolの実行結果をLLMへ返し、ユーザー向けの最終回答を生成する
+        final_response = openai_client.chat.completions.create(
+            model=MODEL,
             messages=[
-                {
-                    "role": "user",
-                    "content": question
-                },
-                response.choices[0].message,
+                {"role": "user", "content": question},
+                assistant_message,
                 {
                     "role": "tool",
                     "tool_call_id": tool_call.id,
-                    "content": tool_output
-                }
-            ]
+                    "content": tool_output,
+                },
+            ],
         )
 
-        return final_response.choices[0].message.content
+        return final_response.choices[0].message.content or ""
 
-async def main():
-    answer = await ask_mcp(
-        r"C:\python\MCP の中から、MCPという文字を含む行を探してください。"
+
+async def main() -> None:
+    question = (
+        f"{DATA_DIR} の中から、MCPという文字を含む行を探してください。"
     )
 
+    answer = await ask_mcp(question)
     print(answer)
 
-asyncio.run(main())
+
+if __name__ == "__main__":
+    asyncio.run(main())
