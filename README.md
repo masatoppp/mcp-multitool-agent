@@ -1,6 +1,8 @@
 # MCP Multi-Tool Agent
 
-MCP（Model Context Protocol）を利用し、複数のPython関数をToolとして公開し、LLMがユーザーの質問内容に応じて適切なToolを選択・実行する仕組みを実装しました。
+MCP（Model Context Protocol）を利用し、複数のPython関数をToolとして公開し、LLMがユーザーの質問内容に応じて適切なToolと引数を選択する仕組みを実装しました。
+
+MCP ClientがServerからTool定義を取得し、OpenAIのFunction Calling形式へ変換してLLMへ渡します。LLMが選択したToolはMCP Client経由でServer側へ実行要求され、Toolの実行結果を用いて最終回答を生成します。
 
 ## 概要
 
@@ -8,31 +10,40 @@ MCP Server側に複数のToolを登録し、MCP Clientから `list_tools()` を�
 
 取得したTool情報をOpenAIのFunction Calling形式へ変換してLLMへ渡すことで、Client側にToolごとの `if / elif` を固定的に記述せず、LLMが質問内容に応じて適切なToolと引数を選択できる構成としています。
 
-LLMが選択したToolはMCP Clientから `call_tool()` を通してMCP Serverへ実行要求され、Server側のTool関数が実際の処理を行います。
+LLMが選択したTool名と引数をMCP Clientが受け取り、`call_tool()` を使用してMCP Serverへ実行を要求します。
 
-Toolの実行結果は再度LLMへ渡し、ユーザーの質問に沿った自然言語の最終回答を生成します。
+実際のファイル読込や検索などの処理はServer側に登録したTool関数が行い、その実行結果をClient経由で再度LLMへ渡します。
+
+LLMは元のユーザー質問とToolの実行結果をもとに、ユーザー向けの最終回答を生成します。
 
 ```text
 ユーザーの質問
 ↓
 MCP ClientがServerからTool定義を取得
+    list_tools()
 ↓
-質問 + Tool情報をLLMへ送信
+MCP Tool定義をOpenAI Function Calling形式へ変換
+↓
+質問 + Tool定義をLLMへ送信
 ↓
 LLMが使用するToolと引数を選択
 ↓
 MCP Clientがcall_tool()でServerへ実行要求
 ↓
-MCP Server側のToolを実行
+MCP Server側のTool関数が実処理
 ↓
 Tool実行結果をMCP Clientへ返す
 ↓
 Tool結果をLLMへ渡す
 ↓
-最終回答を生成
+LLMが最終回答を生成
+↓
+ユーザーへ回答
 ```
 
 ## 主なTool
+
+本実装では、以下の5つのToolをMCP Serverへ登録しています。
 
 ```text
 read_text_file
@@ -45,21 +56,29 @@ get_file_info
 → ファイル名・拡張子・サイズ・存在有無を取得する
 
 search_folder_text
-→ フォルダ内の複数テキストファイルからキーワードを含む行を検索する
+→ フォルダ直下のテキストファイルから
+   キーワードを含む行を検索する
 
 count_keyword
-→ ファイルごとにキーワードの出現回数を取得する
+→ フォルダ直下の各テキストファイルについて
+   キーワードの出現回数を取得する
 ```
 
 各ToolはPython関数として実装し、`@mcp.tool()` デコレータによってMCP ToolとしてServerへ登録しています。
 
+```python
+@mcp.tool()
+def read_text_file(path: str) -> str:
+    """指定したテキストファイルの内容を読み込みます。"""
+```
+
 Tool名、docstringによるdescription、引数schemaなどの情報をMCP Clientが取得し、OpenAIのFunction Calling形式へ変換してLLMへ渡します。
 
-LLMはこれらのTool定義とユーザーの質問をもとに、使用するToolと引数を判断します。
+LLMはこれらのTool定義とユーザーの質問内容をもとに、使用するToolと引数を判断します。
 
 ## MCP Server / Client / LLMの役割
 
-本実装では、それぞれ次の役割を持たせています。
+本実装では、MCP Server・MCP Client・LLMの責務を分離しています。
 
 ```text
 MCP Server
@@ -68,8 +87,9 @@ MCP Server
 
 MCP Client
 → ServerからTool定義を取得する
-→ Tool定義をLLMへ渡す
-→ LLMが選択したToolをServerへ実行要求する
+→ Tool定義をOpenAI形式へ変換してLLMへ渡す
+→ LLMが選択したTool名と引数を受け取る
+→ call_tool()でServerへTool実行を要求する
 → Toolの実行結果をLLMへ返す
 
 LLM
@@ -77,6 +97,8 @@ LLM
 → 使用するToolと引数を選択する
 → Tool実行結果をもとに最終回答を生成する
 ```
+
+Toolの選択はMCP ClientやMCP ServerではなくLLMが行い、ファイル操作などの実処理はServer側のTool関数が担当します。
 
 ## MCPを利用する利点
 
@@ -93,12 +115,14 @@ OpenAI Function Calling形式へ変換
 ↓
 LLMへTool情報を渡す
 ↓
-LLMが必要に応じてToolを選択
+LLMが必要に応じてToolと引数を選択
 ↓
 Clientが call_tool() でServerへ実行要求
 ```
 
-異なる処理をMCP Toolという共通形式で公開し、Client側から統一的に取得・実行できる構成を確認しました。
+Client側ではTool名を固定的に列挙せず、Serverから取得したTool定義を動的に利用しています。
+
+これにより、異なる処理をMCP Toolという共通形式で公開し、Client側から統一的に取得・実行要求できる構成としています。
 
 ## ファイル構成
 
@@ -116,11 +140,11 @@ mcp-multitool-agent/
     └─ 障害対応.txt
 ```
 
-- `server.py` : MCP ServerおよびTool定義
-- `client.py` : MCP Client、OpenAI API連携、Tool選択・実行、最終回答生成
+- `server.py` : MCP Serverおよび5つのToolを定義
+- `client.py` : MCP Client、OpenAI API連携、Tool選択結果の取得、Tool実行要求、最終回答生成
 - `requirements.txt` : 実行に必要なPythonパッケージ
 - `data/` : 動作確認用のダミーテキストデータ
-- Notebook : MCPの構成、Server / Clientの役割、Tool選択から実行までの処理フローを解説
+- `04_MCPを利用した複数Tool連携.ipynb` : MCPの構成と処理フローを段階的に解説
 
 ## 使用技術
 
@@ -136,13 +160,29 @@ Anaconda
 
 今回の実装では、MCP Client・MCP Server・Toolを同一PC上で動作させています。
 
-MCP Server側にファイル操作用のToolを登録し、Client側からServerが公開しているTool定義を取得します。
+`client.py` では `server.py` で生成したMCP Serverインスタンスを読み込み、MCP ClientからTool定義取得およびTool実行要求を行います。
 
-Clientは取得したTool定義をOpenAIのFunction Calling形式へ変換してLLMへ渡し、LLMが選択したToolをMCP経由でServer側に実行要求します。
+```python
+from server import mcp
+```
 
-最終的にNotebookで確認した処理を `client.py` と `server.py` に分離し、Pythonスクリプトとしても実行できる構成としています。
+MCP ClientはServerから取得したTool定義をOpenAIのFunction Calling形式へ変換し、ユーザーの質問とともにLLMへ渡します。
 
-```text
+LLMが返したTool名と引数をClientが受け取り、MCP Server側のToolを実行します。
+
+Notebookで段階的に確認した処理を、最終的に `client.py` と `server.py` に分離しています。
+
+### 実行
+
+必要なライブラリをインストールします。
+
+```bash
+pip install -r requirements.txt
+```
+
+`OPENAI_API_KEY` を環境変数へ設定したうえで、以下を実行します。
+
+```bash
 python client.py
 ```
 
@@ -152,42 +192,150 @@ python client.py
 
 MCP Clientから `list_tools()` を実行し、Server側に登録されているTool定義を取得します。
 
-### 2. OpenAI形式への変換
+```python
+tools_response = await mcp_client.list_tools()
+```
 
-取得したTool名・description・引数schemaをOpenAIのFunction Calling形式へ変換します。
+この段階ではToolの実行は行わず、利用可能なToolの定義情報を取得します。
+
+### 2. OpenAI Function Calling形式への変換
+
+MCPから取得したTool定義と、OpenAI Function Callingが利用するTool定義は形式が異なります。
+
+そのため、以下の情報をOpenAIが利用できる形式へ変換します。
+
+```text
+MCP Tool
+name
+description
+input_schema
+
+↓
+
+OpenAI Function Calling
+name
+description
+parameters
+```
 
 ### 3. LLMによるTool選択
 
-ユーザーの質問と利用可能なTool情報をLLMへ渡し、使用するToolと引数を判断させます。
+ユーザーの質問と利用可能なTool定義をLLMへ渡します。
 
-### 4. Toolの実行
+LLMは質問内容とTool定義を確認し、Toolが必要な場合は使用するTool名と引数を `tool_calls` として返します。
 
-LLMが返したTool名と引数を取得し、MCP Clientから `call_tool()` を使用してServer側のToolを実行します。
+```text
+ユーザー質問
++
+利用可能なTool定義
+↓
+LLM
+↓
+Tool名 + 引数
+```
 
-### 5. 最終回答生成
+### 4. Tool名と引数の取得
 
-Toolの実行結果をLLMへ返し、元のユーザー質問に沿った自然言語の回答を生成します。
+LLMから返された `tool_calls` から、使用するTool名と引数を取得します。
 
-## 実装範囲
+```python
+tool_name = tool_call.function.name
+tool_args = json.loads(tool_call.function.arguments)
+```
 
-今回はMCPの基本的なTool連携を確認することを目的として、1回の質問につき先頭のTool呼び出し1件を処理するシンプルな構成としています。
+`function.arguments` はJSON文字列として返されるため、`json.loads()` を使用してPythonの辞書へ変換します。
 
-また、Toolの実行結果についても先頭のテキスト要素を利用しています。
+### 5. Toolの実行
 
-今後は、以下のような拡張が可能です。
+MCP Clientから `call_tool()` を使用してServer側へTool実行を要求します。
 
-- 複数Toolの連続実行
+```python
+tool_result = await mcp_client.call_tool(
+    tool_name,
+    tool_args
+)
+```
+
+`call_tool()` を呼び出すのはMCP Clientですが、ファイル読込や検索などの具体的な処理はServer側に登録されたTool関数が実行します。
+
+### 6. Tool実行結果の取得
+
+MCP Serverから返されたTool実行結果から、テキスト部分を取得します。
+
+```python
+tool_output = tool_result.content[0].text
+```
+
+### 7. 最終回答の生成
+
+元のユーザー質問、LLMが生成したTool Call、Tool実行結果を再度LLMへ渡します。
+
+```text
+元のユーザー質問
++
+LLMによるTool Call
++
+Tool実行結果
+↓
+LLM
+↓
+ユーザー向け最終回答
+```
+
+Toolの生の実行結果をそのまま返すのではなく、元の質問の意図に沿った自然言語の回答へ整形します。
+
+## 実装上のポイント
+
+本実装では、以下の点を意識しています。
+
+- Toolの実処理をMCP Server側へ集約
+- MCP ClientはTool定義取得と実行要求を担当
+- Tool選択はLLMが担当
+- Client側にToolごとの固定的な `if / elif` を持たせない
+- MCP Tool定義をOpenAI Function Calling形式へ変換
+- Tool実行結果と最終回答生成を分離
+
+これにより、Toolを追加する際もClient側のTool選択ロジックを個別に追加せず、Server側のTool定義を拡張できる構成としています。
+
+## 実装範囲と制約
+
+今回はMCPの基本的なTool連携を確認することを目的として、シンプルな構成としています。
+
+現在の実装には以下の制約があります。
+
+- 1回の応答では `tool_calls[0]` の先頭1件を処理
+- Tool結果は `content[0].text` の先頭テキスト要素を利用
+- 詳細な例外処理は未実装
+- Toolごとのアクセス制御は未実装
+- MCP ClientとServerは同一プロセス内で接続
+
+## 今後の発展案
+
+今後は以下のような拡張が考えられます。
+
 - 複数Tool Callへの対応
-- Tool実行時のエラー処理
-- Toolごとの権限制御
-- リモートMCP Serverとの接続
+- 複数Toolの連続実行
+- Tool実行失敗時のエラーハンドリング
+- Toolごとのアクセス制御
+- stdio / Streamable HTTPを利用した別プロセス接続
 - UIとの連携
+- Tool実行履歴のログ・可観測性の追加
 
 ## Notebook
 
-実装内容、MCP Server / Client / LLMの役割、`list_tools()` と `call_tool()` の違い、Tool選択から実行結果を最終回答へ反映するまでの処理は、以下のNotebookで解説しています。
+MCP Server / Client / LLMの役割、Tool定義取得、Function Calling形式への変換、Tool選択、Tool実行、最終回答生成までの処理は、以下のNotebookで段階的に確認できます。
 
 **`04_MCPを利用した複数Tool連携.ipynb`**
+
+Notebookでは、特に以下の点を確認しています。
+
+- `@mcp.tool()` によるTool登録
+- `list_tools()` によるTool定義取得
+- MCP Tool定義からOpenAI Function Calling形式への変換
+- LLMによるTool選択
+- `tool_calls` からTool名・引数を取得
+- `call_tool()` によるServer側Toolの実行
+- Tool実行結果を利用した最終回答生成
 
 ## 注意事項
 
