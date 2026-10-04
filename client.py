@@ -31,7 +31,7 @@ def convert_mcp_tools_to_openai(mcp_tools) -> list[dict]:
 
 
 async def ask_mcp(question: str) -> str:
-    """質問に応じてLLMがToolを選択し、MCP経由で実行して最終回答を返す。"""
+    """LLMがToolを選択し、MCP Client経由でServer側Toolを実行して最終回答を返す。"""
 
     async with Client(mcp) as mcp_client:
         # MCP Serverが公開しているTool定義を取得する
